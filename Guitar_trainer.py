@@ -9,9 +9,42 @@ Place harmony_engine.py in the same folder.
 
 import tkinter as tk
 from tkinter import ttk
-import random, sys, os
+import random, sys, os, time, math, struct, io, wave
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# ── Optional metronome backend (pygame mixer) ─────────────────────────────────
+# Silently disabled if pygame missing or audio device fails to open.
+_METRONOME_OK = False
+_metronome_tick = None
+_metronome_tock = None
+try:
+    import pygame
+    pygame.mixer.init(frequency=44100, size=-16, channels=1, buffer=256)
+    def _make_click(freq_hz, duration_ms=45, volume=0.55):
+        sample_rate = 44100
+        n_samples = int(sample_rate * duration_ms / 1000)
+        buf = io.BytesIO()
+        with wave.open(buf, 'wb') as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(sample_rate)
+            frames = []
+            for i in range(n_samples):
+                t = i / sample_rate
+                envelope = math.exp(-t * 30)
+                sample = volume * envelope * math.sin(2 * math.pi * freq_hz * t)
+                val = int(sample * 32767)
+                frames.append(struct.pack('<h', max(-32768, min(32767, val))))
+            w.writeframes(b''.join(frames))
+        buf.seek(0)
+        return pygame.mixer.Sound(buf)
+    _metronome_tock = _make_click(1600, 50, 0.75)   # downbeat — higher, louder
+    _metronome_tick = _make_click(900,  35, 0.45)   # other beats — softer
+    _METRONOME_OK = True
+except Exception:
+    _METRONOME_OK = False
+
 try:
     from harmony_engine import (
         NOTES, TRIADS, MODES, NAMED_PROGRESSIONS, CHORD_GRAPH,
@@ -108,10 +141,20 @@ class GuitarTrainer(tk.Tk):
         # Inversion root mode — when True, colour position-0 of voicing as 'root'
         self.prac_inv_root = tk.BooleanVar(value=False)
 
-        # Use 24-fret display (else 12)
-        self.prac_24frets = tk.BooleanVar(value=False)
+        # Anchor band toggles — fretboard visual is ALWAYS 24 frets in Practice mode.
+        # These checkboxes control which fret bands can host root anchors.
+        # Band 13-18: when ticked, roots may sit on frets 13-18
+        # Band 19-22: when ticked, roots may sit on frets 19-22
+        # Untick both → roots stay on frets 0-12 only
+        # Tick both   → roots may sit on frets 0-22 (full range)
+        self.prac_anchors_13_18 = tk.BooleanVar(value=False)
+        self.prac_anchors_19_22 = tk.BooleanVar(value=False)
         # Currently-highlighted target note within a Modes scale (rendered red)
         self._modes_target_note = None   # semitone of note user should land on
+        # Modes drill position selection
+        self.prac_mode_random_position = tk.BooleanVar(value=False)
+        # Which CAGED-style positions are enabled (set of 1-based ints)
+        self.prac_mode_positions = set([1])  # default to position 1 only
 
         # Loop mode: which named progression to cycle (index into NAMED_PROGRESSIONS filtered by level)
         self.prac_loop_prog_idx = tk.IntVar(value=0)
@@ -125,6 +168,17 @@ class GuitarTrainer(tk.Tk):
         self.prac_loop_change_triads = tk.BooleanVar(value=False)
         # Cache of picked triad shapes per chord position in the current loop
         self._loop_triad_shapes = {}
+
+        # Beat strip animation state
+        self._beat_tick_id   = None    # after() id for the 60fps animation tick
+        self._target_start_ms = 0      # absolute ms timestamp when the current target became active
+        # Next-target preview cache — pre-computed so we can show the upcoming chord
+        self._prac_next_preview = None
+        # Metronome and auto-advance toggles
+        self.prac_metronome    = tk.BooleanVar(value=False)
+        self.prac_auto_advance = tk.BooleanVar(value=True)
+        # Track which 16th was last played to avoid double-triggering the click
+        self._last_played_16th = -1
         # Which genres the Loop generator pulls from (multi-select)
         self.prac_loop_genres = {
             'classical': tk.BooleanVar(value=True),
@@ -214,7 +268,7 @@ class GuitarTrainer(tk.Tk):
         # Fretboard
         fb = tk.Frame(self, bg=PANEL2, padx=12, pady=12)
         fb.pack(fill='x', padx=16, pady=(10,0))
-        self._canvas = tk.Canvas(fb, bg='#1e1510', height=210, highlightthickness=0)
+        self._canvas = tk.Canvas(fb, bg='#1e1510', height=240, highlightthickness=0)
         self._canvas.pack(fill='x')
         self._canvas.bind('<Configure>', lambda e: self._render())
 
@@ -523,25 +577,48 @@ class GuitarTrainer(tk.Tk):
     def _draw_fretboard(self, dots):
         c = self._canvas; c.delete('all')
         W = c.winfo_width() or 920
-        FRETS = 24 if (self.mode == 'Practice' and self.prac_24frets.get()) else 12
-        H=210; L=48; R=16; T=28; SG=28; FW=(W-L-R)/FRETS
+        FRETS = self._max_fret()  # Always 24 in Practice mode, 12 in library
+        H=240; L=48; R=16; T=28; SG=28; FW=(W-L-R)/FRETS
+
+        # Strings occupy y=T..T+5*SG (=28..168).
+        # Fret-marker inlay dots are placed in the middle of the fretboard, between
+        # strings 3 and 4 (D and G), as on a real guitar — at y = T + 2.5*SG.
+        inlay_y = T + 2.5*SG       # = 28 + 70 = 98
+        # Fret numbers sit just below the lowest string with a small gap
+        num_y   = T + 5*SG + 22    # = 168 + 22 = 190
 
         for f in range(FRETS+1):
             x = L+f*FW
             c.create_line(x,T-6,x,T+5*SG+6,
                           fill='#5a4a30' if f==0 else '#3d3020',
                           width=3 if f==0 else 1)
+
+        # Fret-marker inlay dots (slime-green outline, dark fill) — placed mid-board
         marker_frets = [3,5,7,9,12,15,17,19,21,24] if FRETS == 24 else [3,5,7,9,12]
+        INLAY_OUTLINE = '#B4FF88'  # slime green
+        INLAY_FILL    = "#eee5e1"  # bone white
+        R_INLAY = 7
         for f in marker_frets:
             mx = L+(f-0.5)*FW
             if f in (12, 24):
-                c.create_oval(mx-18,H-14,mx-10,H-6,fill='#3d3020',outline='')
-                c.create_oval(mx+10,H-14,mx+18,H-6,fill='#3d3020',outline='')
+                # Double-dot for octave markers
+                c.create_oval(mx-13-R_INLAY, inlay_y-R_INLAY,
+                              mx-13+R_INLAY, inlay_y+R_INLAY,
+                              outline=INLAY_OUTLINE, fill=INLAY_FILL, width=2)
+                c.create_oval(mx+13-R_INLAY, inlay_y-R_INLAY,
+                              mx+13+R_INLAY, inlay_y+R_INLAY,
+                              outline=INLAY_OUTLINE, fill=INLAY_FILL, width=2)
             else:
-                c.create_oval(mx-5,H-14,mx+5,H-6,fill='#3d3020',outline='')
-        for f in range(1,FRETS+1):
-            c.create_text(L+(f-0.5)*FW,H-2,text=str(f),fill='#4a4030',font=('Helvetica',9))
+                c.create_oval(mx-R_INLAY, inlay_y-R_INLAY,
+                              mx+R_INLAY, inlay_y+R_INLAY,
+                              outline=INLAY_OUTLINE, fill=INLAY_FILL, width=2)
 
+        # Fret numbers — larger, bold, white
+        for f in range(1,FRETS+1):
+            c.create_text(L+(f-0.5)*FW, num_y, text=str(f),
+                          fill='#B4FF88', font=('Helvetica',11,'bold'))
+
+        # Strings + labels
         labels = TUNING_LABELS[self.tuning_name.get()]
         for s in range(6):
             y = T+(5-s)*SG; thick = max(0.5,3.5-s*0.5)
@@ -729,10 +806,29 @@ class GuitarTrainer(tk.Tk):
                                           fg=ACCENT, font=('Helvetica',28,'bold'))
         self._prac_target_lbl.pack()
 
+        # "Next →" preview row (smaller, faded yellow) — visible above subtitle
+        next_row = tk.Frame(tgt, bg=PANEL2); next_row.pack(pady=(2,0))
+        self._prac_next_arrow = tk.Label(next_row, text='', bg=PANEL2,
+                                          fg='#8a7838',  # faded amber
+                                          font=('Helvetica',13,'bold'))
+        self._prac_next_arrow.pack(side='left')
+        self._prac_next_lbl = tk.Label(next_row, text='', bg=PANEL2,
+                                        fg='#8a7838',  # faded yellow
+                                        font=('Helvetica',16,'bold'))
+        self._prac_next_lbl.pack(side='left', padx=(6,0))
+
         # Subtitle (interval formula / notes)
         self._prac_sub_lbl = tk.Label(tgt, text='', bg=PANEL2, fg=MUTED,
                                        font=('Helvetica',12))
-        self._prac_sub_lbl.pack()
+        self._prac_sub_lbl.pack(pady=(4,0))
+
+        # Beat strip — 16 cells per bar showing the rhythmic position.
+        # Animated cursor moves across in real time at current BPM.
+        beat_wrap = tk.Frame(tgt, bg=PANEL2); beat_wrap.pack(fill='x', pady=(10,2))
+        self._beat_canvas = tk.Canvas(beat_wrap, bg=PANEL2, height=28,
+                                       highlightthickness=0)
+        self._beat_canvas.pack(fill='x')
+        self._beat_canvas.bind('<Configure>', lambda e: self._draw_beat_strip())
 
         # Score row
         score_row = tk.Frame(tgt, bg=PANEL2); score_row.pack(fill='x', pady=(10,0))
@@ -746,7 +842,7 @@ class GuitarTrainer(tk.Tk):
         # ── Fretboard (reuse canvas but embed a copy in practice page) ────
         prac_fb = tk.Frame(self._practice_page, bg=PANEL2, padx=12, pady=10)
         prac_fb.pack(fill='x', pady=(0,6))
-        self._prac_canvas = tk.Canvas(prac_fb, bg='#1e1510', height=210,
+        self._prac_canvas = tk.Canvas(prac_fb, bg='#1e1510', height=240,
                                        highlightthickness=0)
         self._prac_canvas.pack(fill='x')
         self._prac_canvas.bind('<Configure>', lambda e: self._prac_draw())
@@ -858,12 +954,40 @@ class GuitarTrainer(tk.Tk):
                        variable=self.prac_beats, command=on_beats)
         sl.pack(side='left', padx=(4,16))
 
-        # Use 24 frets checkbox
-        tk.Checkbutton(r2, text='Use 24 frets', variable=self.prac_24frets,
+        # Anchor band checkboxes — choose which extended bands roots may use
+        tk.Label(r2, text='Roots:', bg=PANEL, fg=MUTED,
+                 font=('Helvetica',10)).pack(side='left')
+        tk.Checkbutton(r2, text='13-18', variable=self.prac_anchors_13_18,
                        bg=PANEL, fg=TEXT, selectcolor=BTN_BG,
                        activebackground=PANEL, activeforeground=TEXT,
                        font=('Helvetica',10), cursor='hand2',
                        command=self._prac_draw
+                       ).pack(side='left', padx=(4,2))
+        tk.Checkbutton(r2, text='19-22', variable=self.prac_anchors_19_22,
+                       bg=PANEL, fg=TEXT, selectcolor=BTN_BG,
+                       activebackground=PANEL, activeforeground=TEXT,
+                       font=('Helvetica',10), cursor='hand2',
+                       command=self._prac_draw
+                       ).pack(side='left', padx=(0,14))
+
+        # Metronome toggle
+        metro_text = 'Metronome' if _METRONOME_OK else 'Metronome (unavailable)'
+        cb_metro = tk.Checkbutton(r2, text=metro_text,
+                       variable=self.prac_metronome,
+                       bg=PANEL, fg=TEXT, selectcolor=BTN_BG,
+                       activebackground=PANEL, activeforeground=TEXT,
+                       font=('Helvetica',10), cursor='hand2')
+        if not _METRONOME_OK:
+            cb_metro.config(state='disabled', fg=MUTED)
+        cb_metro.pack(side='left', padx=(0,10))
+
+        # Auto-advance toggle (when off, chords only change via Got it / Missed)
+        tk.Checkbutton(r2, text='Auto-advance',
+                       variable=self.prac_auto_advance,
+                       bg=PANEL, fg=TEXT, selectcolor=BTN_BG,
+                       activebackground=PANEL, activeforeground=TEXT,
+                       font=('Helvetica',10), cursor='hand2',
+                       command=self._prac_auto_toggle_changed
                        ).pack(side='left', padx=(0,14))
 
         # Reveal (reuse global)
@@ -1026,96 +1150,122 @@ class GuitarTrainer(tk.Tk):
 
     # ── Practice settings setters ──────────────────────────────────────────────
 
+    def _scale_positions(self, intervals, key_root_semi):
+        """For a scale defined by interval list [0, a, b, ...] and a key root,
+        return a list of (position_number, anchor_fret_on_low_E, window_start, window_end)
+        tuples. There is one position per scale note. Position M starts on scale
+        degree M, anchored on the low E string.
+
+        Each position spans a 4-fret window starting at the anchor fret.
+        """
+        # Low E = semitone 4 (in standard tuning).
+        low_e = TUNINGS[self.tuning_name.get()][0]
+        positions = []
+        for m, deg_semi in enumerate(intervals, start=1):
+            # Note name on low E that starts this position
+            target_semi = (key_root_semi + deg_semi) % 12
+            # Lowest fret on low E where this note sits (within visual range)
+            anchor_fret = (target_semi - low_e) % 12
+            # Window starts ~1 fret BEFORE anchor (for stretch) and spans 4 frets
+            win_start = max(0, anchor_fret - 1)
+            win_end   = min(self._max_fret(), anchor_fret + 4)
+            positions.append((m, anchor_fret, win_start, win_end))
+        return positions
+
+    def _modes_position_notes(self, intervals, key_root_semi, position_number):
+        """Return all scale notes within the 4-fret window of a specific position.
+        Each note is (string, fret, semitone, interval_from_root)."""
+        positions = self._scale_positions(intervals, key_root_semi)
+        # Find the position by number (1-based)
+        pos = next((p for p in positions if p[0] == position_number), None)
+        if pos is None:
+            return []
+        _, anchor, win_start, win_end = pos
+
+        tuning = TUNINGS[self.tuning_name.get()]
+        notes = []
+        for s in range(6):
+            for f in range(win_start, win_end + 1):
+                n = (tuning[s] + f) % 12
+                iv = (n - key_root_semi) % 12
+                if iv in [i % 12 for i in intervals]:
+                    notes.append((s, f, n, iv))
+        return notes
+
     def _modes_position_dots(self, intervals, root, ticked):
         """
-        Build scale dots with graduated position scope:
-          D1: full primary 4-fret position
-          D2: primary + ~30% of notes borrowed from ONE adjacent position
-          D3: primary + full adjacent position
-          D4: primary + full positions on BOTH sides (2 adjacent)
-          D5: primary + full positions on both sides + extra ~50% bleed beyond
-        Position size = 4 frets (one hand span).
-        The 'target' note (self._modes_target_note) gets red colour.
+        CAGED-style position scope graduated by Difficulty.
+        A 'position' = the scale playable in a 4-5 fret hand span, starting on
+        scale degree M on the low E string. There are N positions where N is
+        the number of notes in the scale (5 for pentatonic, 7 for diatonic, etc.)
+
+        Difficulty mapping:
+          D1: just the anchor position (1 position)
+          D2: anchor + a FEW random notes from ONE adjacent position
+          D3: anchor + the full adjacent position (2 positions total)
+          D4: anchor + BOTH adjacent positions (3 positions: M-1, M, M+1)
+          D5: D4 set + MORE borrowed notes from positions 2 steps away
+        Positions wrap (position 0 = position N, position N+1 = position 1).
+
+        The anchor position is either:
+          - self._modes_anchor_position (if user selected it)
+          - randomly chosen each call (if prac_mode_random_position is ticked)
+          - position 1 by default
         """
-        max_fret = self._max_fret()
-        lv       = self.difficulty
-        tuning   = TUNINGS[self.tuning_name.get()]
+        positions_count = len(intervals)
+        lv = self.difficulty
 
-        # ── 1. Find the primary anchor fret (lowest root on lowest ticked string) ──
-        anchor_max = self._max_anchor_fret()
-        anchor_fret = None
-        for s in ticked:
-            for f in range(min(max_fret, anchor_max) + 1):
-                if (tuning[s] + f) % 12 == root % 12:
-                    anchor_fret = f
-                    break
-            if anchor_fret is not None:
-                break
+        # Pick the anchor position
+        if self.prac_mode_random_position.get():
+            anchor_pos = random.randint(1, positions_count)
+        else:
+            enabled = [p for p in self.prac_mode_positions if 1 <= p <= positions_count]
+            anchor_pos = enabled[0] if enabled else 1
 
-        if anchor_fret is None:
-            anchor_fret = 0  # fallback
+        # Determine which positions are active and at what density (fraction)
+        def adj(p, delta):
+            """Wrap position number around (1..N)."""
+            return ((p - 1 + delta) % positions_count) + 1
 
-        # ── 2. Build primary and adjacent 4-fret position windows ──
-        POS_SIZE = 4
-        primary_start = max(0, anchor_fret - 1)
-        primary_end   = min(max_fret, primary_start + POS_SIZE)
-
-        lower_start = max(0, primary_start - POS_SIZE)
-        lower_end   = max(0, primary_start - 1)
-        if lower_end < lower_start:
-            lower_start = lower_end  # no room for lower position
-
-        upper_start = min(max_fret, primary_end + 1)
-        upper_end   = min(max_fret, primary_end + POS_SIZE)
-        if upper_end < upper_start:
-            upper_start = upper_end
-
-        # ── 3. Decide which windows are included and what fraction of borrowed notes ──
-        # primary always 100%. lower/upper get fractions depending on lv.
-        # We'll prefer borrowing from the UPPER (higher frets) first, then both.
         if lv == 1:
-            windows = [(primary_start, primary_end, 1.0)]
+            active = [(anchor_pos, 1.0)]
         elif lv == 2:
-            windows = [(primary_start, primary_end, 1.0),
-                       (upper_start, upper_end, 0.35)]   # borrow ~35% from upper
+            # Borrow a few notes from ONE adjacent (the next one up)
+            active = [(anchor_pos, 1.0), (adj(anchor_pos, +1), 0.30)]
         elif lv == 3:
-            windows = [(primary_start, primary_end, 1.0),
-                       (upper_start, upper_end, 1.0)]    # full adjacent
+            # Full adjacent position
+            active = [(anchor_pos, 1.0), (adj(anchor_pos, +1), 1.0)]
         elif lv == 4:
-            windows = [(primary_start, primary_end, 1.0),
-                       (lower_start, lower_end, 1.0),
-                       (upper_start, upper_end, 1.0)]
+            # Both adjacent positions full
+            active = [(adj(anchor_pos, -1), 1.0),
+                      (anchor_pos, 1.0),
+                      (adj(anchor_pos, +1), 1.0)]
         else:  # lv == 5
-            windows = [(primary_start, primary_end, 1.0),
-                       (lower_start, lower_end, 1.0),
-                       (upper_start, upper_end, 1.0),
-                       # extra bleed beyond the two adjacent, ~50%
-                       (max(0, lower_start - POS_SIZE),
-                        max(0, lower_start - 1), 0.5),
-                       (min(max_fret, upper_end + 1),
-                        min(max_fret, upper_end + POS_SIZE), 0.5)]
+            # D4 set + more borrowed notes from positions 2 steps away
+            active = [(adj(anchor_pos, -1), 1.0),
+                      (anchor_pos, 1.0),
+                      (adj(anchor_pos, +1), 1.0),
+                      (adj(anchor_pos, -2), 0.5),
+                      (adj(anchor_pos, +2), 0.5)]
 
-        # ── 4. Collect candidate notes per window, then apply fraction sampling ──
         dots = []
         seen = set()
-        for (start, end, frac) in windows:
-            if start > end:
-                continue
-            candidates = []
-            for s in range(6):
-                for f in range(start, end + 1):
-                    n = (tuning[s] + f) % 12
-                    iv = (n - root) % 12
-                    if iv in intervals and (s, f) not in seen:
-                        candidates.append((s, f, n, iv))
-            # Sample by fraction
+        # Track which positions are user-allowed if not random
+        user_allowed = self.prac_mode_positions if not self.prac_mode_random_position.get() else None
+
+        for (pos_num, frac) in active:
+            # Skip positions the user disabled (only respects the anchor selection
+            # in non-random mode; adjacent positions are auto-included regardless
+            # of the user's tickboxes because the difficulty model is about
+            # graduated scope, not user-curated lists).
+            candidates = self._modes_position_notes(intervals, root, pos_num)
+            # Apply fractional sampling
             if frac < 1.0:
                 k = max(1, int(round(len(candidates) * frac)))
-                # Deterministic seed per target so the borrowed pattern is stable
-                # while the target is up (won't reshuffle on every redraw)
-                seed_state = (anchor_fret, start, end, tuple(intervals), root)
+                seed_state = (anchor_pos, pos_num, tuple(intervals), root)
                 rng = random.Random(hash(seed_state))
                 candidates = rng.sample(candidates, min(k, len(candidates)))
+
             for (s, f, n, iv) in candidates:
                 if (s, f) in seen:
                     continue
@@ -1135,12 +1285,51 @@ class GuitarTrainer(tk.Tk):
             return 24
         return 12
 
+    def _anchor_fret_allowed(self, fret):
+        """Return True if a root anchor is allowed on this fret.
+        Frets 0-12 are always allowed in Practice mode.
+        Band 13-18 and 19-22 are gated by their checkboxes (independent).
+        Frets 23-24 are never anchor-eligible (kept for visual range only)."""
+        if self.mode != 'Practice':
+            return fret <= 12
+        if fret <= 12:
+            return True
+        if 13 <= fret <= 18 and self.prac_anchors_13_18.get():
+            return True
+        if 19 <= fret <= 22 and self.prac_anchors_19_22.get():
+            return True
+        return False
+
     def _max_anchor_fret(self):
-        """Highest fret that root anchors are allowed to sit on.
-        Determined by the 'Use 24 frets' checkbox."""
-        if self.mode == 'Practice' and self.prac_24frets.get():
-            return 24
+        """Highest possible anchor fret given current band selections.
+        Used where a single 'upper bound' is needed, but callers should
+        prefer _anchor_fret_allowed() to handle the gap case correctly."""
+        if self.mode != 'Practice':
+            return 12
+        if self.prac_anchors_19_22.get():
+            return 22
+        if self.prac_anchors_13_18.get():
+            return 18
         return 12
+
+    def _prac_auto_toggle_changed(self):
+        """Called when 'Auto-advance' is toggled. Reconfigure timers/animation."""
+        if not self.prac_running:
+            return
+        if self.prac_auto_advance.get():
+            if self.prac_timer_id is None:
+                ms = self._prac_target_ms()
+                self.prac_timer_id = self.after(ms, self._prac_auto_advance)
+            if self._beat_tick_id is None:
+                self._beat_tick()
+        else:
+            if self.prac_timer_id:
+                self.after_cancel(self.prac_timer_id)
+                self.prac_timer_id = None
+            if self._beat_tick_id:
+                self.after_cancel(self._beat_tick_id)
+                self._beat_tick_id = None
+            self._draw_beat_strip()
 
     def _prac_tempo_changed(self):
         """Called when BPM or beats slider changes. Reschedule timer if running."""
@@ -1165,6 +1354,7 @@ class GuitarTrainer(tk.Tk):
         self._inf_prog_cache = []; self._inf_prog_idx = 0
         self._clear_triad_cache()
         self._prac_rebuild_settings()
+        self._prac_clear_preview()
         if self.prac_running: self._prac_advance()
 
     def _prac_set_sequence(self, v):
@@ -1184,17 +1374,49 @@ class GuitarTrainer(tk.Tk):
         self._inf_prog_cache = []; self._inf_prog_idx = 0
         self._clear_triad_cache()
         self._prac_rebuild_settings()
+        self._prac_clear_preview()
         if self.prac_running: self._prac_advance()
 
     def _prac_set_difficulty(self, v):
         self.difficulty = v
         self._prac_rebuild_settings()
+        self._prac_clear_preview()
         if self.prac_running: self._prac_advance()
+
+    def _current_modes_scale_name(self):
+        """Return the currently active mode/scale name for the Modes drill.
+        Considers override settings."""
+        override = self.prac_mode_override.get()
+        if override and not override.startswith('Follow') and override in MODES:
+            return override
+        # If no override, default to Ionian / Aeolian based on current key tonality
+        # In Random mode, just default to Ionian
+        return 'Ionian (Major)'
+
+    def _prac_mode_random_toggled(self):
+        """Random-position checkbox toggled."""
+        self._prac_rebuild_settings()
+        if self.prac_running:
+            self._prac_clear_preview()
+            self._prac_advance()
+
+    def _prac_toggle_mode_position(self, pos_num):
+        """User clicked a position number button — toggle it in/out of the set."""
+        if pos_num in self.prac_mode_positions:
+            if len(self.prac_mode_positions) > 1:
+                self.prac_mode_positions.discard(pos_num)
+        else:
+            self.prac_mode_positions.add(pos_num)
+        self._prac_rebuild_settings()
+        if self.prac_running:
+            self._prac_clear_preview()
+            self._prac_advance()
 
     def _prac_change_triads_toggled(self):
         """Called when 'Change triads each loop' is toggled — clear cache so
         next chord re-picks shapes."""
         self._loop_triad_shapes = {}
+        self._prac_clear_preview()
         if self.prac_running: self._prac_advance()
 
     def _clear_triad_cache(self):
@@ -1209,7 +1431,8 @@ class GuitarTrainer(tk.Tk):
             self._prac_loop_regenerate()
         else:
             self._prac_rebuild_settings()
-            if self.prac_running: self._prac_advance()
+            self._prac_clear_preview()
+        if self.prac_running: self._prac_advance()
 
     def _prac_loop_regenerate(self):
         """Generate a new Markov-based loop progression from selected genres."""
@@ -1251,6 +1474,7 @@ class GuitarTrainer(tk.Tk):
         self._loop_chord_idx = 0
         self._clear_triad_cache()
         self._prac_rebuild_settings()
+        self._prac_clear_preview()
         if self.prac_running: self._prac_advance()
 
     def _prac_set_loop_prog(self, idx):
@@ -1258,15 +1482,18 @@ class GuitarTrainer(tk.Tk):
         self._loop_chord_idx = 0
         self._clear_triad_cache()
         self._prac_rebuild_settings()
+        self._prac_clear_preview()
         if self.prac_running: self._prac_advance()
 
     def _prac_set_triad_override(self, v):
         self.prac_triad_override.set(v)
         self._clear_triad_cache()
+        self._prac_clear_preview()
         if self.prac_running: self._prac_advance()
 
     def _prac_set_mode_override(self, v):
         self.prac_mode_override.set(v)
+        self._prac_clear_preview()
         if self.prac_running: self._prac_advance()
 
     # ── Practice pool builders ─────────────────────────────────────────────────
@@ -1645,8 +1872,8 @@ class GuitarTrainer(tk.Tk):
             formula = '  '.join(DEG_NAMES.get(i, str(i)) for i in ivs)
             # Modes drill: scale is built around the KEY's root (not the chord root),
             # but the TARGET LANDING NOTE for this chord step is the chord's root.
-            # The scale stays in the key; the user must land on the current chord root.
-            key_root = self.root_note  # fixed key when Loop/Infinite
+            # Use _loop_key_root if it exists (Random key mode rotates it per cycle).
+            key_root = getattr(self, '_loop_key_root', self.root_note)
             self._modes_target_note = chord_info['root_semitone']
             return {
                 'name': mode_name,
@@ -1805,28 +2032,65 @@ class GuitarTrainer(tk.Tk):
         self.prac_running = False
         if self.prac_timer_id:
             self.after_cancel(self.prac_timer_id); self.prac_timer_id = None
+        if self._beat_tick_id:
+            self.after_cancel(self._beat_tick_id); self._beat_tick_id = None
+        self._prac_next_preview = None
         self._prac_start_btn.config(text='▶  Start', bg=GREEN, fg='#04342C')
+        # Redraw beat strip in idle state
+        self._draw_beat_strip()
 
     def _prac_advance(self):
         """Move to next target and restart the timer."""
         if self.prac_timer_id:
             self.after_cancel(self.prac_timer_id)
 
-        target = self._prac_next_target()
+        # If we have a pre-computed preview, promote it to current.
+        # Otherwise generate a new target.
+        if self._prac_next_preview is not None:
+            target = self._prac_next_preview
+            self._prac_next_preview = None
+        else:
+            target = self._prac_next_target()
         if not target: return
 
-        # Pick root
-        root = self._prac_pick_root(target)
-        target = dict(target); target['active_root'] = root
+        # Pick root (skip if already done at preview time)
+        if 'active_root' not in target:
+            root = self._prac_pick_root(target)
+            target = dict(target); target['active_root'] = root
         self._prac_target = target
+
+        # Pre-compute the NEXT target for preview
+        try:
+            nxt = self._prac_next_target()
+            if nxt is not None:
+                root2 = self._prac_pick_root(nxt)
+                nxt = dict(nxt); nxt['active_root'] = root2
+                self._prac_next_preview = nxt
+        except Exception:
+            self._prac_next_preview = None
 
         self._prac_update_display()
         self._prac_update_history()
         self.prac_running = True
 
-        # Schedule next advance
-        ms = self._prac_target_ms()
-        self.prac_timer_id = self.after(ms, self._prac_auto_advance)
+        # Reset beat tracking
+        self._target_start_ms = time.time() * 1000
+        self._last_played_16th = -1
+
+        # Schedule auto-advance and start animation ONLY if auto-advance is on
+        if self.prac_auto_advance.get():
+            ms = self._prac_target_ms()
+            self.prac_timer_id = self.after(ms, self._prac_auto_advance)
+            if self._beat_tick_id is None:
+                self._beat_tick()
+            # Play the downbeat click immediately on chord change
+            if self.prac_metronome.get() and _METRONOME_OK:
+                try: _metronome_tock.play()
+                except Exception: pass
+            self._last_played_16th = 0
+        else:
+            self.prac_timer_id = None
+            self._draw_beat_strip()
 
 
     def _prac_auto_advance(self):
@@ -1861,6 +2125,143 @@ class GuitarTrainer(tk.Tk):
 
     # ── Practice display ───────────────────────────────────────────────────────
 
+    def _prac_clear_preview(self):
+        """Discard the pre-computed next-target. Used when settings change so
+        we don't carry stale previews into the next advance."""
+        self._prac_next_preview = None
+
+    def _update_next_preview(self):
+        """Show 'Next → <chord>' preview under the current target name."""
+        nxt = self._prac_next_preview
+        if not nxt:
+            self._prac_next_arrow.config(text='')
+            self._prac_next_lbl.config(text='')
+            return
+        drill = self.prac_drill.get()
+        nroot = nxt.get('active_root', 0)
+        rn    = NOTES[nroot] if nroot is not None else ''
+        if drill == 'Notes':
+            text = rn
+        elif drill in ('Triads', 'Modes'):
+            text = f'{rn} {nxt.get("name", "")}'
+        else:  # Progressions
+            text = nxt.get('name', '')
+        self._prac_next_arrow.config(text='Next →')
+        self._prac_next_lbl.config(text=text)
+
+    # ── Beat strip rendering and animation ────────────────────────────────────
+
+    def _draw_beat_strip(self):
+        """Compact beat strip — marks for each 16th, with the CURRENT
+        sixteenth emphasised (bigger and thicker) instead of a sweeping cursor.
+        """
+        c = self._beat_canvas
+        c.delete('all')
+        W = c.winfo_width() or 800
+        H = 28
+
+        if not self.prac_running or not self._prac_target:
+            # Idle — dim baseline only
+            c.create_line(20, H//2, W-20, H//2, fill='#3a3020', width=1)
+            return
+
+        beats = max(1, self.prac_beats.get())
+        sixteenths_total = beats * 4
+
+        pad_x = 16
+        avail = W - 2 * pad_x
+        cell_w = avail / sixteenths_total
+
+        baseline_y = H - 4
+        c.create_line(pad_x, baseline_y, W - pad_x, baseline_y,
+                      fill='#5a4a30', width=1)
+
+        # Determine which 16th the timer is currently on
+        try:
+            elapsed_ms = (time.time() * 1000) - self._target_start_ms
+            total_ms = self._prac_target_ms()
+            frac = min(0.999, max(0.0, elapsed_ms / total_ms))
+        except Exception:
+            frac = 0.0
+        current_idx = int(frac * sixteenths_total)
+
+        for i in range(sixteenths_total):
+            x = pad_x + (i + 0.5) * cell_w
+            absolute_beat = i // 4
+            sub_idx       = i % 4
+            beat_in_bar   = absolute_beat % 4 + 1
+            is_downbeat   = (sub_idx == 0)
+            is_bar_start  = (is_downbeat and (absolute_beat % 4 == 0))
+            is_current    = (i == current_idx)
+
+            # Base sizes (compact strip)
+            if is_bar_start:
+                colour = '#4db896'   # green — beat 1 of any bar
+                base_h, base_w = 14, 3
+            elif is_downbeat:
+                colour = '#F0E8D8'   # bone white — beats 2,3,4
+                base_h, base_w = 12, 3
+            else:
+                colour = '#6a5a40'   # dim — sixteenth subdivisions
+                base_h, base_w = 5, 1
+
+            # Active emphasis — make the CURRENT mark bigger/thicker
+            if is_current:
+                if is_downbeat:
+                    # Beats get a much bigger emphasis
+                    mark_h = base_h + 8
+                    mark_w = base_w + 2
+                else:
+                    # 16ths only grow slightly
+                    mark_h = base_h + 2
+                    mark_w = base_w + 1
+            else:
+                mark_h, mark_w = base_h, base_w
+
+            top = baseline_y - mark_h
+            c.create_rectangle(x - mark_w/2, top, x + mark_w/2, baseline_y,
+                               fill=colour, outline='')
+
+        # Chord-change marker at the right edge (compact)
+        change_x = pad_x + sixteenths_total * cell_w
+        c.create_rectangle(change_x - 2, baseline_y - 16,
+                           change_x + 2, baseline_y + 2,
+                           fill='#C04040', outline='')
+
+    def _beat_tick(self):
+        """30fps tick — redraws the beat strip and triggers metronome clicks."""
+        if not self.prac_running or not self.prac_auto_advance.get():
+            self._beat_tick_id = None
+            return
+
+        # Determine current 16th from elapsed time
+        try:
+            elapsed_ms = (time.time() * 1000) - self._target_start_ms
+            total_ms = self._prac_target_ms()
+            beats = max(1, self.prac_beats.get())
+            sixteenths_total = beats * 4
+            frac = min(0.999, max(0.0, elapsed_ms / total_ms))
+            current_idx = int(frac * sixteenths_total)
+        except Exception:
+            current_idx = -1
+
+        # Trigger metronome click when a new BEAT (downbeat) is reached.
+        # Sixteenth indices 0, 4, 8, 12 are downbeats. Idx % 16 == 0 = beat 1 of a bar.
+        if (current_idx != self._last_played_16th
+                and current_idx >= 0
+                and current_idx % 4 == 0):
+            self._last_played_16th = current_idx
+            if self.prac_metronome.get() and _METRONOME_OK:
+                if current_idx % 16 == 0:
+                    try: _metronome_tock.play()
+                    except Exception: pass
+                else:
+                    try: _metronome_tick.play()
+                    except Exception: pass
+
+        self._draw_beat_strip()
+        self._beat_tick_id = self.after(33, self._beat_tick)
+
     def _prac_update_display(self):
         target = self._prac_target
         if not target: return
@@ -1879,8 +2280,12 @@ class GuitarTrainer(tk.Tk):
             self._prac_sub_lbl.config(
                 text=f'Key of {rn}  ·  {target.get("subtitle","")}')
 
+        self._update_next_preview()
         self._prac_update_score()
         self._prac_draw()
+        # Beat strip redraws via the tick loop, but draw once immediately so
+        # the bar layout appears on the first beat.
+        self._draw_beat_strip()
 
     def _prac_update_score(self):
         s = self._prac_score
@@ -1958,15 +2363,14 @@ class GuitarTrainer(tk.Tk):
         # ── Notes drill: just show every occurrence of the target note ────────
         if drill == 'Notes':
             dots = []
-            anchor_max = self._max_anchor_fret()
             for s in range(6):
                 for f in range(self._max_fret() + 1):
                     n = note_at(s, f)
                     if n == root:
                         if not all_strings and s not in ticked:
                             continue
-                        if f > anchor_max:
-                            # Beyond anchor range — show as faded background note
+                        if not self._anchor_fret_allowed(f):
+                            # Outside allowed anchor bands — faded background dot
                             if reveal == 'Root only': continue
                             dots.append((s, f, 'all', NOTES[n]))
                         else:
@@ -1975,6 +2379,13 @@ class GuitarTrainer(tk.Tk):
                         if reveal == 'Root only': continue
                         dots.append((s, f, 'all', NOTES[n]))
             return dots
+
+        # ── Modes drill: use position-aware scale builder ─────────────────────
+        if drill == 'Modes':
+            ivs = target.get('intervals') or []
+            ivs_mod = [iv % 12 for iv in ivs]
+            # 'root' on the target = key_root for the scale
+            return self._modes_position_dots(ivs_mod, root, ticked)
 
         # ── Resolve chord/scale intervals and dot-type labels ─────────────────
         ivs = target.get('intervals') or [0, 4, 7]
@@ -2042,10 +2453,13 @@ class GuitarTrainer(tk.Tk):
 
         # Find anchor positions on ticked strings.
         # Anchor on whatever the voicing's position-0 note is (the bass).
+        # Only frets within allowed anchor bands (0-12 always, 13-18 / 19-22 by checkbox).
         target_root_iv = bass_iv_mod
         anchors = []  # list of (string, fret)
         for s in ticked:
             for f in range(self._max_fret() + 1):
+                if not self._anchor_fret_allowed(f):
+                    continue
                 if (note_at(s, f) - root) % 12 == target_root_iv:
                     anchors.append((s, f))
 
@@ -2056,8 +2470,11 @@ class GuitarTrainer(tk.Tk):
                that matches target_iv_mod, or None."""
             best = None
             best_dist = 999
+            # Search neighbours up to the full 24-fret visual range; the
+            # anchor itself is already restricted by the band checkboxes above.
+            search_max = self._max_fret() + 1
             for f in range(max(0, anchor_fret - FRET_REACH),
-                           min(13, anchor_fret + FRET_REACH + 1)):
+                           min(search_max, anchor_fret + FRET_REACH + 1)):
                 if (note_at(string_idx, f) - root) % 12 == target_iv_mod:
                     dist = abs(f - anchor_fret)
                     if dist < best_dist:
@@ -2102,24 +2519,41 @@ class GuitarTrainer(tk.Tk):
         c = self._prac_canvas
         c.delete('all')
         W = c.winfo_width() or 920
-        FRETS = 24 if self.prac_24frets.get() else 12
-        H=210; L=48; R=16; T=28; SG=28; FW=(W-L-R)/FRETS
+        FRETS = self._max_fret()  # Always 24 in Practice mode
+        H=240; L=48; R=16; T=28; SG=28; FW=(W-L-R)/FRETS
+
+        # Inlay dots placed in the middle of the fretboard (between strings 3-4).
+        inlay_y = T + 2.5*SG       # = 98
+        num_y   = T + 5*SG + 22    # = 190
 
         for f in range(FRETS+1):
             x = L+f*FW
             c.create_line(x,T-6,x,T+5*SG+6,
                           fill='#5a4a30' if f==0 else '#3d3020',
                           width=3 if f==0 else 1)
+        # Fret-marker inlay dots (slime-green outline) — placed mid-board
         marker_frets = [3,5,7,9,12,15,17,19,21,24] if FRETS == 24 else [3,5,7,9,12]
+        INLAY_OUTLINE = '#B4FF88'  # slime green
+        INLAY_FILL    = "#eee5e1"  # bone white
+        R_INLAY = 7
         for f in marker_frets:
             mx = L+(f-0.5)*FW
             if f in (12, 24):
-                c.create_oval(mx-18,H-14,mx-10,H-6,fill='#3d3020',outline='')
-                c.create_oval(mx+10,H-14,mx+18,H-6,fill='#3d3020',outline='')
+                c.create_oval(mx-13-R_INLAY, inlay_y-R_INLAY,
+                              mx-13+R_INLAY, inlay_y+R_INLAY,
+                              outline=INLAY_OUTLINE, fill=INLAY_FILL, width=2)
+                c.create_oval(mx+13-R_INLAY, inlay_y-R_INLAY,
+                              mx+13+R_INLAY, inlay_y+R_INLAY,
+                              outline=INLAY_OUTLINE, fill=INLAY_FILL, width=2)
             else:
-                c.create_oval(mx-5,H-14,mx+5,H-6,fill='#3d3020',outline='')
+                c.create_oval(mx-R_INLAY, inlay_y-R_INLAY,
+                              mx+R_INLAY, inlay_y+R_INLAY,
+                              outline=INLAY_OUTLINE, fill=INLAY_FILL, width=2)
+
+        # Fret numbers — larger, bold, white
         for f in range(1,FRETS+1):
-            c.create_text(L+(f-0.5)*FW,H-2,text=str(f),fill='#4a4030',font=('Helvetica',9))
+            c.create_text(L+(f-0.5)*FW, num_y, text=str(f),
+                          fill='#B4FF88', font=('Helvetica',11,'bold'))
 
         labels = TUNING_LABELS[self.tuning_name.get()]
         for s in range(6):
